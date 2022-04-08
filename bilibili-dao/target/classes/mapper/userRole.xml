@@ -1,0 +1,23 @@
+<?xml version="1.0" encoding="UTF-8" ?>
+<!DOCTYPE mapper
+        PUBLIC "-//mybatis.org//DTD MAPPER 3.0//EN"
+        "http://mybatis.org/dtd/mybatis-3-mapper.dtd">
+<mapper namespace="com.marco.bilibili.dao.UserRoleDao">
+
+    <select id="getUserRoleByUserId" parameterType="java.lang.Long" resultType="com.marco.bilibili.domain.auth.UserRole">
+        select
+            tur.*,
+            tar.name roleName,
+            tar.code roleCode
+        from
+            t_user_role tur
+            left join t_auth_role tar on tur.roleId = tar.id
+        where
+            tur.userId = #{userId}
+    </select>
+    
+    <insert id="addUserRole" parameterType="com.marco.bilibili.domain.auth.UserRole">
+        insert into t_user_role(userId,roleId,createTime) values (#{userId}, #{roleId}, #{createTime})
+    </insert>
+
+</mapper>

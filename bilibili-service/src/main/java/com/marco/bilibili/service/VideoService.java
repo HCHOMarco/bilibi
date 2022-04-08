@@ -1,0 +1,339 @@
+package com.marco.bilibili.service;
+
+import com.marco.bilibili.dao.VideoDao;
+import com.marco.bilibili.domain.*;
+import com.marco.bilibili.domain.exception.ConditionException;
+import com.marco.bilibili.service.util.FastDFSUtil;
+import com.marco.bilibili.service.util.IpUtil;
+import com.mysql.cj.x.protobuf.MysqlxCrud;
+import eu.bitwalker.useragentutils.UserAgent;
+import javafx.beans.binding.ObjectExpression;
+import org.apache.mahout.cf.taste.common.TasteException;
+import org.apache.mahout.cf.taste.impl.common.FastByIDMap;
+import org.apache.mahout.cf.taste.impl.model.GenericDataModel;
+import org.apache.mahout.cf.taste.impl.model.GenericPreference;
+import org.apache.mahout.cf.taste.impl.model.GenericUserPreferenceArray;
+import org.apache.mahout.cf.taste.impl.neighborhood.NearestNUserNeighborhood;
+import org.apache.mahout.cf.taste.impl.recommender.GenericUserBasedRecommender;
+import org.apache.mahout.cf.taste.impl.similarity.UncenteredCosineSimilarity;
+import org.apache.mahout.cf.taste.model.DataModel;
+import org.apache.mahout.cf.taste.model.PreferenceArray;
+import org.apache.mahout.cf.taste.neighborhood.UserNeighborhood;
+import org.apache.mahout.cf.taste.recommender.RecommendedItem;
+import org.apache.mahout.cf.taste.recommender.Recommender;
+import org.apache.mahout.cf.taste.similarity.UserSimilarity;
+import org.springframework.beans.factory.annotation.Autowired;
+import org.springframework.stereotype.Service;
+import org.springframework.transaction.annotation.Transactional;
+
+import javax.servlet.http.HttpServletRequest;
+import javax.servlet.http.HttpServletResponse;
+import java.text.SimpleDateFormat;
+import java.util.*;
+import java.util.stream.Collectors;
+
+@Service
+public class VideoService {
+
+    @Autowired
+    private VideoDao videoDao;
+
+    @Autowired
+    private FastDFSUtil fastDFSUtil;
+
+    @Autowired
+    private UserCoinService userCoinService;
+
+    @Autowired
+    private UserService userService;
+
+
+    @Transactional
+    public void addVideos(Video video) {
+        Date now = new Date();
+        video.setCreateTime(new Date());
+        int tmp = videoDao.addVideos(video);
+        Long videoId = video.getId();
+        List<VideoTag> tagList = video.getVideoTagList();
+        tagList.forEach(item->{
+            item.setCreateTime(now);
+            item.setVideoId(videoId);
+        });
+        videoDao.batchAddVideoTags(tagList);
+    }
+
+    public PageResult<Video> pageListVideos(Integer size, Integer no, String area) {
+        if(size == null || no == null){
+            throw new ConditionException("参数异常");
+        }
+        Map<String, Object> params = new HashMap<>();
+        params.put("start", (no - 1) * size);
+        params.put("limit", size);
+        params.put("area", area);
+        List<Video> list = new ArrayList<>();
+        Integer total = videoDao.pageCountVideos(params);
+        if(total > 0){
+            list = videoDao.pageListVideos(params);
+        }
+        return new PageResult<Video>(total, list);
+    }
+
+    public void viewVideoOnlineBySlices(HttpServletRequest request,
+                                        HttpServletResponse response,
+                                        String url) throws Exception {
+        fastDFSUtil.viewVideoOnlineBySlices(request, response, url);
+    }
+
+    public void addVideoLike(Long videoId, Long userId) {
+        Video video = videoDao.getVideoById(videoId);
+        if(video == null){
+            throw new ConditionException("非法视频");
+        }
+        VideoLike videoLike = videoDao.getVideoLikeByVideoIdAndUserId(videoId, userId);
+        if(videoLike != null){
+            throw new ConditionException("视频已经点赞");
+        }
+        videoLike = new VideoLike();
+        videoLike.setUserId(userId);
+        videoLike.setVideoId(videoId);
+        videoLike.setCreateTime(new Date());
+        videoDao.addVideoLike(videoLike);
+    }
+
+    public void deleteVideoLike(Long videoId, Long userId) {
+        //已经得到视频id和用户id，不是合法的是不允许删除的，所以在调用这个接口前已经判断过信息是否是合法的了
+        videoDao.deleteVideoLike(videoId, userId);
+    }
+
+    public Map<String, Object> getVideoLikes(Long videoId, Long userId) {
+        Long count = videoDao.getVideoLikes(videoId);
+        VideoLike videoLike = videoDao.getVideoLikeByVideoIdAndUserId(videoId, userId);
+        Boolean like = (videoLike != null);
+        Map<String, Object> result = new HashMap<>();
+        result.put("count", count);
+        result.put("like", like);
+        return result;
+    }
+
+
+    @Transactional
+    public void addVideoCollection(VideoCollection videoCollection, Long userId) {
+        Long videoId = videoCollection.getVideoId();
+        Long groupId = videoCollection.getGroupId();
+        if(videoId == null || groupId == null){
+            throw new ConditionException("参数异常！");
+        }
+        Video video = videoDao.getVideoById(videoId);
+        if(video == null){
+            throw new ConditionException("非法视频！");
+        }
+        //删除原有视频收藏
+        videoDao.deleteVideoCollection(videoId, userId);
+        //添加新的视频收藏
+        videoCollection.setUserId(userId);
+        videoCollection.setCreateTime(new Date());
+        videoDao.addVideoCollection(videoCollection);
+    }
+
+    public void deleteVideoCollection(Long videoId, Long userId) {
+        videoDao.deleteVideoCollection(videoId, userId);
+    }
+
+    public Map<String, Object> getVideoCollections(Long videoId, Long userId) {
+        Long count = videoDao.getVideoCollections(videoId);
+        VideoCollection videoCollection = videoDao.getVideoCollectionByVideoIdAndUserId(videoId, userId);
+        boolean like = videoCollection != null;
+        Map<String, Object> result = new HashMap<>();
+        result.put("count", count);
+        result.put("like", like);
+        return result;
+    }
+
+    @Transactional
+    public void addVideoCoins(VideoCoin videoCoin, Long userId) {
+        Long videoId = videoCoin.getVideoId();
+        Integer amount = videoCoin.getAmount();
+        if(videoId == null){
+            throw new ConditionException("参数异常！");
+        }
+        Video video = videoDao.getVideoById(videoId);
+        if(video == null){
+            throw new ConditionException("非法视频！");
+        }
+        //查询当前登录用户是否拥有足够的硬币
+        Integer userCoinsAmount = userCoinService.getUserCoinsAmount(userId);
+        userCoinsAmount = userCoinsAmount == null ? 0 : userCoinsAmount;
+        if(amount > userCoinsAmount){
+            throw new ConditionException("硬币数量不足！");
+        }
+        //查询当前登录用户对该视频已经投了多少硬币
+        VideoCoin dbVideoCoin = videoDao.getVideoCoinByVideoIdAndUserId(videoId, userId);
+        //新增视频投币
+        if(dbVideoCoin == null){
+            videoCoin.setUserId(userId);
+            videoCoin.setCreateTime(new Date());
+            videoDao.addVideoCoin(videoCoin);
+        }else{
+            Integer dbAmount = dbVideoCoin.getAmount();
+            dbAmount += amount;
+            //更新视频投币
+            videoCoin.setUserId(userId);
+            videoCoin.setAmount(dbAmount);
+            videoCoin.setUpdateTime(new Date());
+            videoDao.updateVideoCoin(videoCoin);
+        }
+        //更新用户当前硬币总数
+        userCoinService.updateUserCoinsAmount(userId, (userCoinsAmount-amount));
+    }
+
+    public Map<String, Object> getVideoCoins(Long videoId, Long userId) {
+        Long count = videoDao.getVideoCoinsAmount(videoId);
+        VideoCoin videoCoin = videoDao.getVideoCoinByVideoIdAndUserId(videoId, userId);
+        boolean like = videoCoin != null;
+        Map<String, Object> result = new HashMap<>();
+        result.put("count", count);
+        result.put("like", like);
+        return result;
+    }
+
+    public void addVideoComment(VideoComment videoComment, long userId) {
+        Long videoId = videoComment.getVideoId();
+        if(videoId == null){
+            throw new ConditionException("参数错误");
+        }
+        Video video = videoDao.getVideoById(videoId);
+        if(video == null){
+            throw new ConditionException("非法视频");
+        }
+        videoComment.setUserId(userId);
+        videoComment.setCreateTime(new Date());
+        videoDao.addVideoComment(videoComment);
+    }
+
+    public PageResult<VideoComment> pageListVideoComments(Integer size, Integer no, Long videoId) {
+        if(size == null || no == null || videoId == null){
+            throw new ConditionException("参数错误");
+        }
+        Video video = videoDao.getVideoById(videoId);
+        if(video == null){
+            throw new ConditionException("非法视频");
+        }
+        Map<String, Object> params = new HashMap<>();
+        params.put("begin", (no - 1) * size);
+        params.put("limit", size);
+        params.put("videoId", videoId);
+        Integer total = videoDao.pageCountVideoComments(params);
+        List<VideoComment> list = new ArrayList<>();
+        if(total > 0){
+            //一级评论
+            list = videoDao.pageListVideoComments(params);
+            //批量查询二级评论
+            List<Long> parentIdList = list.stream().map(VideoComment::getId).collect(Collectors.toList());
+            List<VideoComment> childCommentList = videoDao.batchGetVideoCommentsByRootIds(parentIdList);
+            //批量查询用户信息
+            //获取一级评论的用户id
+            Set<Long> userIdList = list.stream().map(VideoComment::getUserId).collect(Collectors.toSet());
+            //获取二级评论的用户id
+            Set<Long> childUserIdList = childCommentList.stream().map(VideoComment::getUserId).collect(Collectors.toSet());
+            //获取该评论要回复的用户的id
+            Set<Long> replyUserIdList = childCommentList.stream().map(VideoComment::getReplyUserId).collect(Collectors.toSet());
+            userIdList.addAll(childUserIdList);
+            userIdList.addAll(replyUserIdList);
+            //获取所有相关用户的个人信息
+            List<UserInfo> userInfoList = userService.batchGetUserInfoByUserIds(userIdList);
+            Map<Long, UserInfo> userInfoMap = userInfoList.stream().collect(Collectors.toMap(UserInfo :: getUserId, userInfo -> userInfo));
+            list.forEach(comment -> {
+                Long id = comment.getId();
+                List<VideoComment> childList = new ArrayList<>();
+                childCommentList.forEach(child -> {
+                    if(id.equals(child.getRootId())){
+                        child.setUserInfo(userInfoMap.get(child.getUserId()));
+                        child.setReplyUserInfo(userInfoMap.get(child.getReplyUserId()));
+                        childList.add(child);
+                    }
+                });
+                comment.setChildList(childList);
+                comment.setUserInfo(userInfoMap.get(comment.getUserId()));
+            });
+        }
+        return new PageResult<>(total, list);
+    }
+
+    public Map<String, Object> getVideoDetails(Long videoId) {
+        Video video = videoDao.getVideoDetails(videoId);
+        Long userId = video.getUserId();
+        User user = userService.getUserInfo(userId);
+        UserInfo userInfo = user.getUserInfo();
+        Map<String, Object> result = new HashMap<>();
+        result.put("video", video);
+        result.put("userInfo", userInfo);
+        return result;
+    }
+
+    public void addVideoView(VideoView videoView, HttpServletRequest request) {
+        Long userId = videoView.getUserId();
+        Long videoId = videoView.getVideoId();
+        //生成client
+        String agent = request.getHeader("User-Agent");
+        UserAgent userAgent = UserAgent.parseUserAgentString(agent);
+        String clientId = String.valueOf(userAgent.getId());
+        String ip = IpUtil.getIP(request);
+        Map<String, Object> params = new HashMap<>();
+        if(userId != null){
+            params.put("userId", userId);
+        }else{
+            params.put("ip", ip);
+            params.put("clientId", clientId);
+        }
+        Date now = new Date();
+        SimpleDateFormat sdf = new SimpleDateFormat("yyyy-MM-dd");
+        params.put("today",  sdf.format(now));
+        params.put("videoId", videoId);
+        //添加观看记录
+        VideoView dbVideoView = videoDao.getVideoView(params);
+        if(dbVideoView == null){
+            videoView.setIp(ip);
+            videoView.setClientId(clientId);
+            videoView.setCreateTime(new Date());
+            videoDao.addVideoView(videoView);
+        }
+    }
+
+    public Integer getVideoViewCounts(Long videoId) {
+        return videoDao.getVideoViewCounts(videoId);
+    }
+
+    public List<Video> recommend(Long userId) throws TasteException {
+        List<UserPreference> list = videoDao.getAllUserPreference();
+        //创建数据模型
+        DataModel dataModel = this.createDataModel(list);
+        //获取用户相似程度
+        UserSimilarity similarity = new UncenteredCosineSimilarity(dataModel);
+        System.out.println(similarity.userSimilarity(1, 2));
+        //获取用户邻居（邻居数量为设定的2）
+        UserNeighborhood userNeighborhood = new NearestNUserNeighborhood(2, similarity, dataModel);
+        long[] ar = userNeighborhood.getUserNeighborhood(userId);
+        //构建推荐器
+        Recommender recommender = new GenericUserBasedRecommender(dataModel, userNeighborhood, similarity);
+        //推荐视频(最大推荐数量为设定的5)
+        List<RecommendedItem> recommendedItems = recommender.recommend(userId, 5);
+        List<Long> itemIds = recommendedItems.stream().map(RecommendedItem :: getItemID).collect(Collectors.toList());
+        return videoDao.batchGetVideosByIds(itemIds);
+    }
+
+    private DataModel createDataModel(List<UserPreference> userPreferenceList){
+        FastByIDMap<PreferenceArray> fastByIDMap = new FastByIDMap<>();
+        Map<Long, List<UserPreference>> map = userPreferenceList.stream().collect(Collectors.groupingBy(UserPreference::getUserId));
+        Collection<List<UserPreference>> list = map.values();
+        for(List<UserPreference> userPreferences : list){
+            GenericPreference[] array = new GenericPreference[userPreferences.size()];
+            for(int i = 0; i < userPreferences.size(); i++){
+                UserPreference userPreference = userPreferences.get(i);
+                GenericPreference item = new GenericPreference(userPreference.getUserId(), userPreference.getVideoId(), userPreference.getValue());
+                array[i] = item;
+            }
+            fastByIDMap.put(array[0].getUserID(), new GenericUserPreferenceArray(Arrays.asList(array)));
+        }
+        return new GenericDataModel(fastByIDMap);
+    }
+}
